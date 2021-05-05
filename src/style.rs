@@ -267,7 +267,7 @@ impl ProgressStyle {
         )
     }
 
-    pub(crate) fn format_state(&self, state: &ProgressState) -> Vec<String> {
+    pub(crate) async fn format_state(&self, state: &ProgressState) -> Vec<String> {
         let (pos, len) = state.position();
         let mut rv = vec![];
 
@@ -313,7 +313,7 @@ impl ProgressStyle {
             });
 
             rv.push(if let Some(ref var) = wide_element {
-                let total_width = state.width();
+                let total_width = state.width().await;
                 if var.key == "bar" {
                     let bar_width = total_width.saturating_sub(measure_text_width(&s));
                     s.replace(

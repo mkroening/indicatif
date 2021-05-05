@@ -205,7 +205,6 @@
 //! * `improved_unicode`: adds improved unicode support (graphemes, better width calculation)
 
 mod format;
-mod iter;
 mod progress_bar;
 #[cfg(feature = "rayon")]
 mod rayon;
@@ -214,7 +213,6 @@ mod style;
 mod utils;
 
 pub use crate::format::{BinaryBytes, DecimalBytes, FormattedDuration, HumanBytes, HumanDuration};
-pub use crate::iter::{ProgressBarIter, ProgressIterator};
 pub use crate::progress_bar::{MultiProgress, ProgressBar, WeakProgressBar};
 pub use crate::state::ProgressDrawTarget;
 pub use crate::style::{ProgressFinish, ProgressStyle};

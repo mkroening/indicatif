@@ -2,9 +2,7 @@ use std::borrow::Cow;
 use std::fmt;
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, Mutex, RwLock, Weak};
-use std::thread;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use crate::state::{
@@ -13,7 +11,8 @@ use crate::state::{
 };
 use crate::style::ProgressStyle;
 use crate::utils::Estimate;
-use crate::{ProgressBarIter, ProgressIterator};
+use async_channel::{Receiver, Sender};
+use async_lock::{Mutex, RwLock};
 
 /// A progress bar or spinner
 ///
@@ -65,101 +64,49 @@ impl ProgressBar {
                 status: Status::InProgress,
                 started: Instant::now(),
                 est: Estimate::new(),
-                tick_thread: None,
                 steady_tick: 0,
             })),
         }
     }
 
     /// A convenience builder-like function for a progress bar with a given style
-    pub fn with_style(self, style: ProgressStyle) -> ProgressBar {
-        self.state.lock().unwrap().style = style;
+    pub async fn with_style(self, style: ProgressStyle) -> ProgressBar {
+        self.state.lock().await.style = style;
         self
     }
 
     /// A convenience builder-like function for a progress bar with a given prefix
-    pub fn with_prefix(self, prefix: impl Into<Cow<'static, str>>) -> ProgressBar {
-        self.state.lock().unwrap().prefix = prefix.into();
+    pub async fn with_prefix(self, prefix: impl Into<Cow<'static, str>>) -> ProgressBar {
+        self.state.lock().await.prefix = prefix.into();
         self
     }
 
     /// A convenience builder-like function for a progress bar with a given message
-    pub fn with_message(self, message: impl Into<Cow<'static, str>>) -> ProgressBar {
-        self.state.lock().unwrap().message = message.into();
+    pub async fn with_message(self, message: impl Into<Cow<'static, str>>) -> ProgressBar {
+        self.state.lock().await.message = message.into();
         self
     }
 
     /// A convenience builder-like function for a progress bar with a given position
-    pub fn with_position(self, pos: u64) -> ProgressBar {
-        self.state.lock().unwrap().pos = pos;
+    pub async fn with_position(self, pos: u64) -> ProgressBar {
+        self.state.lock().await.pos = pos;
         self
     }
 
     /// Creates a new spinner
     ///
     /// This spinner by default draws directly to stderr. This adds the default spinner style to it.
-    pub fn new_spinner() -> ProgressBar {
+    pub async fn new_spinner() -> ProgressBar {
         let rv = ProgressBar::new(!0);
-        rv.set_style(ProgressStyle::default_spinner());
+        rv.set_style(ProgressStyle::default_spinner()).await;
         rv
     }
 
     /// Overrides the stored style
     ///
     /// This does not redraw the bar. Call [`ProgressBar::tick()`] to force it.
-    pub fn set_style(&self, style: ProgressStyle) {
-        self.state.lock().unwrap().style = style;
-    }
-
-    /// Spawns a background thread to tick the progress bar
-    ///
-    /// When this is enabled a background thread will regularly tick the progress bar in the given
-    /// interval (in milliseconds). This is useful to advance progress bars that are very slow by
-    /// themselves.
-    ///
-    /// When steady ticks are enabled, calling [`ProgressBar::tick()`] on a progress bar does not
-    /// have any effect.
-    pub fn enable_steady_tick(&self, ms: u64) {
-        let mut state = self.state.lock().unwrap();
-        state.steady_tick = ms;
-        if state.tick_thread.is_some() {
-            return;
-        }
-
-        // Using a weak pointer is required to prevent a potential deadlock. See issue #133
-        let state_arc = Arc::downgrade(&self.state);
-        state.tick_thread = Some(thread::spawn(move || Self::steady_tick(state_arc, ms)));
-
-        ::std::mem::drop(state);
-        // use the side effect of tick to force the bar to tick.
-        self.tick();
-    }
-
-    fn steady_tick(state_arc: Weak<Mutex<ProgressState>>, mut ms: u64) {
-        loop {
-            thread::sleep(Duration::from_millis(ms));
-            if let Some(state_arc) = state_arc.upgrade() {
-                let mut state = state_arc.lock().unwrap();
-                if state.is_finished() || state.steady_tick == 0 {
-                    state.steady_tick = 0;
-                    state.tick_thread = None;
-                    break;
-                }
-                if state.tick != 0 {
-                    state.tick = state.tick.saturating_add(1);
-                }
-                ms = state.steady_tick;
-
-                state.draw().ok();
-            } else {
-                break;
-            }
-        }
-    }
-
-    /// Undoes [`ProgressBar::enable_steady_tick()`]
-    pub fn disable_steady_tick(&self) {
-        self.enable_steady_tick(0);
+    pub async fn set_style(&self, style: ProgressStyle) {
+        self.state.lock().await.style = style;
     }
 
     /// Limit redrawing of progress bar to every `n` steps
@@ -181,8 +128,8 @@ impl ProgressBar {
     /// ```
     ///
     /// Note that `ProgressDrawTarget` may impose additional buffering of redraws.
-    pub fn set_draw_delta(&self, n: u64) {
-        let mut state = self.state.lock().unwrap();
+    pub async fn set_draw_delta(&self, n: u64) {
+        let mut state = self.state.lock().await;
         state.draw_delta = n;
         state.draw_next = state.pos.saturating_add(state.draw_delta);
     }
@@ -202,8 +149,8 @@ impl ProgressBar {
     /// ```
     ///
     /// Note that the [`ProgressDrawTarget`] may impose additional buffering of redraws.
-    pub fn set_draw_rate(&self, n: u64) {
-        let mut state = self.state.lock().unwrap();
+    pub async fn set_draw_rate(&self, n: u64) {
+        let mut state = self.state.lock().await;
         state.draw_rate = n;
         state.draw_next = state.pos.saturating_add(state.per_sec() / n);
     }
@@ -211,32 +158,34 @@ impl ProgressBar {
     /// Manually ticks the spinner or progress bar
     ///
     /// This automatically happens on any other change to a progress bar.
-    pub fn tick(&self) {
+    pub async fn tick(&self) {
         self.update_and_draw(|state| {
             if state.steady_tick == 0 || state.tick == 0 {
                 state.tick = state.tick.saturating_add(1);
             }
-        });
+        })
+        .await;
     }
 
     /// Advances the position of the progress bar by `delta`
-    pub fn inc(&self, delta: u64) {
+    pub async fn inc(&self, delta: u64) {
         self.update_and_draw(|state| {
             state.pos = state.pos.saturating_add(delta);
             if state.steady_tick == 0 || state.tick == 0 {
                 state.tick = state.tick.saturating_add(1);
             }
         })
+        .await
     }
 
     /// A quick convenience check if the progress bar is hidden
-    pub fn is_hidden(&self) -> bool {
-        self.state.lock().unwrap().draw_target.is_hidden()
+    pub async fn is_hidden(&self) -> bool {
+        self.state.lock().await.draw_target.is_hidden()
     }
 
     /// Indicates that the progress bar finished
-    pub fn is_finished(&self) -> bool {
-        self.state.lock().unwrap().is_finished()
+    pub async fn is_finished(&self) -> bool {
+        self.state.lock().await.is_finished()
     }
 
     /// Print a log line above the progress bar
@@ -246,13 +195,13 @@ impl ProgressBar {
     ///
     /// Note that if the progress bar is hidden (which by default happens if the progress bar is
     /// redirected into a file) `println()` will not do anything either.
-    pub fn println<I: AsRef<str>>(&self, msg: I) {
-        let mut state = self.state.lock().unwrap();
+    pub async fn println<I: AsRef<str>>(&self, msg: I) {
+        let mut state = self.state.lock().await;
 
         let mut lines: Vec<String> = msg.as_ref().lines().map(Into::into).collect();
         let orphan_lines = lines.len();
         if state.should_render() && !state.draw_target.is_hidden() {
-            lines.extend(state.style.format_state(&*state));
+            lines.extend(state.style.format_state(&*state).await);
         }
 
         let draw_state = ProgressDrawState {
@@ -263,11 +212,11 @@ impl ProgressBar {
             move_cursor: false,
         };
 
-        state.draw_target.apply_draw_state(draw_state).ok();
+        state.draw_target.apply_draw_state(draw_state).await.ok();
     }
 
     /// Sets the position of the progress bar
-    pub fn set_position(&self, pos: u64) {
+    pub async fn set_position(&self, pos: u64) {
         self.update_and_draw(|state| {
             state.draw_next = pos;
             state.pos = pos;
@@ -275,27 +224,30 @@ impl ProgressBar {
                 state.tick = state.tick.saturating_add(1);
             }
         })
+        .await
     }
 
     /// Sets the length of the progress bar
-    pub fn set_length(&self, len: u64) {
+    pub async fn set_length(&self, len: u64) {
         self.update_and_draw(|state| {
             state.len = len;
         })
+        .await
     }
 
     /// Increase the length of the progress bar
-    pub fn inc_length(&self, delta: u64) {
+    pub async fn inc_length(&self, delta: u64) {
         self.update_and_draw(|state| {
             state.len = state.len.saturating_add(delta);
         })
+        .await
     }
 
     /// Sets the current prefix of the progress bar
     ///
     /// For the prefix to be visible, the `{prefix}` placeholder must be present in the template
     /// (see [`ProgressStyle`]).
-    pub fn set_prefix(&self, prefix: impl Into<Cow<'static, str>>) {
+    pub async fn set_prefix(&self, prefix: impl Into<Cow<'static, str>>) {
         let prefix = prefix.into();
         self.update_and_draw(|state| {
             state.prefix = prefix;
@@ -303,13 +255,14 @@ impl ProgressBar {
                 state.tick = state.tick.saturating_add(1);
             }
         })
+        .await
     }
 
     /// Sets the current message of the progress bar
     ///
     /// For the message to be visible, the `{msg}` placeholder must be present in the template (see
     /// [`ProgressStyle`]).
-    pub fn set_message(&self, msg: impl Into<Cow<'static, str>>) {
+    pub async fn set_message(&self, msg: impl Into<Cow<'static, str>>) {
         let msg = msg.into();
         self.update_and_draw(|state| {
             state.message = msg;
@@ -317,6 +270,7 @@ impl ProgressBar {
                 state.tick = state.tick.saturating_add(1);
             }
         })
+        .await
     }
 
     /// Creates a new weak reference to this `ProgressBar`
@@ -330,71 +284,74 @@ impl ProgressBar {
     ///
     /// This can be useful if the progress bars made a large jump or was paused for a prolonged
     /// time.
-    pub fn reset_eta(&self) {
+    pub async fn reset_eta(&self) {
         self.update_and_draw(|state| {
             state.est.reset(state.pos);
-        });
+        })
+        .await;
     }
 
     /// Resets elapsed time
-    pub fn reset_elapsed(&self) {
+    pub async fn reset_elapsed(&self) {
         self.update_and_draw(|state| {
             state.started = Instant::now();
-        });
+        })
+        .await;
     }
 
     /// Resets all of the progress bar state
-    pub fn reset(&self) {
-        self.reset_eta();
-        self.reset_elapsed();
+    pub async fn reset(&self) {
+        self.reset_eta().await;
+        self.reset_elapsed().await;
         self.update_and_draw(|state| {
             state.draw_next = 0;
             state.pos = 0;
             state.status = Status::InProgress;
-        });
+        })
+        .await;
     }
 
     /// Finishes the progress bar and leaves the current message
-    pub fn finish(&self) {
-        self.state.lock().unwrap().finish();
+    pub async fn finish(&self) {
+        self.state.lock().await.finish().await;
     }
 
     /// Finishes the progress bar at current position and leaves the current message
-    pub fn finish_at_current_pos(&self) {
-        self.state.lock().unwrap().finish_at_current_pos();
+    pub async fn finish_at_current_pos(&self) {
+        self.state.lock().await.finish_at_current_pos().await;
     }
 
     /// Finishes the progress bar and sets a message
     ///
     /// For the message to be visible, the `{msg}` placeholder must be present in the template (see
     /// [`ProgressStyle`]).
-    pub fn finish_with_message(&self, msg: impl Into<Cow<'static, str>>) {
-        self.state.lock().unwrap().finish_with_message(msg);
+    pub async fn finish_with_message(&self, msg: impl Into<Cow<'static, str>>) {
+        self.state.lock().await.finish_with_message(msg).await;
     }
 
     /// Finishes the progress bar and completely clears it
-    pub fn finish_and_clear(&self) {
-        self.state.lock().unwrap().finish_and_clear();
+    pub async fn finish_and_clear(&self) {
+        self.state.lock().await.finish_and_clear().await;
     }
 
     /// Finishes the progress bar and leaves the current message and progress
-    pub fn abandon(&self) {
-        self.state.lock().unwrap().abandon();
+    pub async fn abandon(&self) {
+        self.state.lock().await.abandon().await;
     }
 
     /// Finishes the progress bar and sets a message, and leaves the current progress
     ///
     /// For the message to be visible, the `{msg}` placeholder must be present in the template (see
     /// [`ProgressStyle`]).
-    pub fn abandon_with_message(&self, msg: impl Into<Cow<'static, str>>) {
-        self.state.lock().unwrap().abandon_with_message(msg);
+    pub async fn abandon_with_message(&self, msg: impl Into<Cow<'static, str>>) {
+        self.state.lock().await.abandon_with_message(msg).await;
     }
 
     /// Finishes the progress bar using the behavior stored in the [`ProgressStyle`]
     ///
     /// See [`ProgressStyle::on_finish()`].
-    pub fn finish_using_style(&self) {
-        self.state.lock().unwrap().finish_using_style();
+    pub async fn finish_using_style(&self) {
+        self.state.lock().await.finish_using_style().await;
     }
 
     /// Sets a different draw target for the progress bar
@@ -410,102 +367,46 @@ impl ProgressBar {
     /// **Note:** Calling this method on a [`ProgressBar`] linked with a [`MultiProgress`] (after
     /// running [`MultiProgress::add`]) will unlink this progress bar. If you don't want this
     /// behavior, call [`MultiProgress::set_draw_target`] instead.
-    pub fn set_draw_target(&self, target: ProgressDrawTarget) {
-        let mut state = self.state.lock().unwrap();
-        state.draw_target.disconnect();
+    pub async fn set_draw_target(&self, target: ProgressDrawTarget) {
+        let mut state = self.state.lock().await;
+        state.draw_target.disconnect().await;
         state.draw_target = target;
     }
 
-    /// Wraps an [`Iterator`] with the progress bar
-    ///
-    /// ```rust,no_run
-    /// # use indicatif::ProgressBar;
-    /// let v = vec![1, 2, 3];
-    /// let pb = ProgressBar::new(3);
-    /// for item in pb.wrap_iter(v.iter()) {
-    ///     // ...
-    /// }
-    /// ```
-    pub fn wrap_iter<It: Iterator>(&self, it: It) -> ProgressBarIter<It> {
-        it.progress_with(self.clone())
-    }
-
-    /// Wraps an [`io::Read`] with the progress bar
-    ///
-    /// ```rust,no_run
-    /// # use std::fs::File;
-    /// # use std::io;
-    /// # use indicatif::ProgressBar;
-    /// # fn test () -> io::Result<()> {
-    /// let source = File::open("work.txt")?;
-    /// let mut target = File::create("done.txt")?;
-    /// let pb = ProgressBar::new(source.metadata()?.len());
-    /// io::copy(&mut pb.wrap_read(source), &mut target);
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn wrap_read<R: io::Read>(&self, read: R) -> ProgressBarIter<R> {
-        ProgressBarIter {
-            progress: self.clone(),
-            it: read,
-        }
-    }
-
-    /// Wraps an [`io::Write`] with the progress bar
-    ///
-    /// ```rust,no_run
-    /// # use std::fs::File;
-    /// # use std::io;
-    /// # use indicatif::ProgressBar;
-    /// # fn test () -> io::Result<()> {
-    /// let mut source = File::open("work.txt")?;
-    /// let target = File::create("done.txt")?;
-    /// let pb = ProgressBar::new(source.metadata()?.len());
-    /// io::copy(&mut source, &mut pb.wrap_write(target));
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn wrap_write<W: io::Write>(&self, write: W) -> ProgressBarIter<W> {
-        ProgressBarIter {
-            progress: self.clone(),
-            it: write,
-        }
-    }
-
-    fn update_and_draw<F: FnOnce(&mut ProgressState)>(&self, f: F) {
+    async fn update_and_draw<F: FnOnce(&mut ProgressState)>(&self, f: F) {
         // Delegate to the wrapped state.
-        let mut state = self.state.lock().unwrap();
-        state.update_and_draw(f);
+        let mut state = self.state.lock().await;
+        state.update_and_draw(f).await;
     }
 
     /// Returns the current position
-    pub fn position(&self) -> u64 {
-        self.state.lock().unwrap().pos
+    pub async fn position(&self) -> u64 {
+        self.state.lock().await.pos
     }
 
     /// Returns the current length
-    pub fn length(&self) -> u64 {
-        self.state.lock().unwrap().len
+    pub async fn length(&self) -> u64 {
+        self.state.lock().await.len
     }
 
     /// Returns the current ETA
-    pub fn eta(&self) -> Duration {
-        self.state.lock().unwrap().eta()
+    pub async fn eta(&self) -> Duration {
+        self.state.lock().await.eta()
     }
 
     /// Returns the current rate of progress
-    pub fn per_sec(&self) -> u64 {
-        self.state.lock().unwrap().per_sec()
+    pub async fn per_sec(&self) -> u64 {
+        self.state.lock().await.per_sec()
     }
 
     /// Returns the current expected duration
-    pub fn duration(&self) -> Duration {
-        self.state.lock().unwrap().duration()
+    pub async fn duration(&self) -> Duration {
+        self.state.lock().await.duration()
     }
 
     /// Returns the current elapsed time
-    pub fn elapsed(&self) -> Duration {
-        self.state.lock().unwrap().started.elapsed()
+    pub async fn elapsed(&self) -> Duration {
+        self.state.lock().await.started.elapsed()
     }
 }
 
@@ -543,7 +444,7 @@ impl MultiProgress {
 
     /// Creates a new multi progress object with the given draw target.
     pub fn with_draw_target(draw_target: ProgressDrawTarget) -> MultiProgress {
-        let (tx, rx) = channel();
+        let (tx, rx) = async_channel::unbounded();
         MultiProgress {
             state: Arc::new(RwLock::new(MultiProgressState {
                 objects: Vec::new(),
@@ -559,9 +460,9 @@ impl MultiProgress {
     }
 
     /// Sets a different draw target for the multiprogress bar.
-    pub fn set_draw_target(&self, target: ProgressDrawTarget) {
-        let mut state = self.state.write().unwrap();
-        state.draw_target.disconnect();
+    pub async fn set_draw_target(&self, target: ProgressDrawTarget) {
+        let mut state = self.state.write().await;
+        state.draw_target.disconnect().await;
         state.draw_target = target;
     }
 
@@ -569,8 +470,8 @@ impl MultiProgress {
     ///
     /// This can reduce flickering, but do not enable it if you intend to change the number of
     /// progress bars.
-    pub fn set_move_cursor(&self, move_cursor: bool) {
-        self.state.write().unwrap().move_cursor = move_cursor;
+    pub async fn set_move_cursor(&self, move_cursor: bool) {
+        self.state.write().await.move_cursor = move_cursor;
     }
 
     /// Adds a progress bar.
@@ -578,8 +479,8 @@ impl MultiProgress {
     /// The progress bar added will have the draw target changed to a
     /// remote draw target that is intercepted by the multi progress
     /// object overriding custom `ProgressDrawTarget` settings.
-    pub fn add(&self, pb: ProgressBar) -> ProgressBar {
-        self.push(None, pb)
+    pub async fn add(&self, pb: ProgressBar) -> ProgressBar {
+        self.push(None, pb).await
     }
 
     /// Inserts a progress bar.
@@ -590,17 +491,17 @@ impl MultiProgress {
     ///
     /// If `index >= MultiProgressState::objects.len()`, the progress bar
     /// is added to the end of the list.
-    pub fn insert(&self, index: usize, pb: ProgressBar) -> ProgressBar {
-        self.push(Some(index), pb)
+    pub async fn insert(&self, index: usize, pb: ProgressBar) -> ProgressBar {
+        self.push(Some(index), pb).await
     }
 
-    fn push(&self, pos: Option<usize>, pb: ProgressBar) -> ProgressBar {
+    async fn push(&self, pos: Option<usize>, pb: ProgressBar) -> ProgressBar {
         let new = MultiObject {
             done: false,
             draw_state: None,
         };
 
-        let mut state = self.state.write().unwrap();
+        let mut state = self.state.write().await;
         let idx = match state.free_set.pop() {
             Some(idx) => {
                 state.objects[idx] = Some(new);
@@ -623,7 +524,8 @@ impl MultiProgress {
                 idx,
                 chan: Mutex::new(self.tx.clone()),
             },
-        });
+        })
+        .await;
         pb
     }
 
@@ -633,8 +535,8 @@ impl MultiProgress {
     /// by the methods `MultiProgress::insert` or `MultiProgress::add`.
     /// If the passed progress bar does not satisfy the condition above,
     /// the `remove` method does nothing.
-    pub fn remove(&self, pb: &ProgressBar) {
-        let idx = match &pb.state.lock().unwrap().draw_target.kind {
+    pub async fn remove(&self, pb: &ProgressBar) {
+        let idx = match &pb.state.lock().await.draw_target.kind {
             ProgressDrawTargetKind::Remote { state, idx, .. } => {
                 // Check that this progress bar is owned by the current MultiProgress.
                 assert!(Arc::ptr_eq(&self.state, state));
@@ -643,7 +545,7 @@ impl MultiProgress {
             _ => return,
         };
 
-        self.state.write().unwrap().remove_idx(idx);
+        self.state.write().await.remove_idx(idx);
     }
 
     /// Waits for all progress bars to report that they are finished.
@@ -651,22 +553,22 @@ impl MultiProgress {
     /// You need to call this as this will request the draw instructions
     /// from the remote progress bars.  Not calling this will deadlock
     /// your program.
-    pub fn join(&self) -> io::Result<()> {
-        self.join_impl(false)
+    pub async fn join(&self) -> io::Result<()> {
+        self.join_impl(false).await
     }
 
     /// Works like `join` but clears the progress bar in the end.
-    pub fn join_and_clear(&self) -> io::Result<()> {
-        self.join_impl(true)
+    pub async fn join_and_clear(&self) -> io::Result<()> {
+        self.join_impl(true).await
     }
 
-    fn join_impl(&self, clear: bool) -> io::Result<()> {
+    async fn join_impl(&self, clear: bool) -> io::Result<()> {
         if self.joining.load(Ordering::Acquire) {
             panic!("Already joining!");
         }
         self.joining.store(true, Ordering::Release);
 
-        let move_cursor = self.state.read().unwrap().move_cursor;
+        let move_cursor = self.state.read().await.move_cursor;
         // Max amount of grouped together updates at once. This is meant
         // to ensure there isn't a situation where continuous updates prevent
         // any actual draws happening.
@@ -675,15 +577,15 @@ impl MultiProgress {
         let mut grouped = 0usize;
         let mut orphan_lines: Vec<String> = Vec::new();
         let mut force_draw = false;
-        while !self.state.read().unwrap().is_done() {
+        while !self.state.read().await.is_done() {
             let (idx, draw_state) = if let Some(peeked) = recv_peek.take() {
                 peeked
             } else {
-                self.rx.recv().unwrap()
+                self.rx.recv().await.unwrap()
             };
             force_draw |= draw_state.finished || draw_state.force_draw;
 
-            let mut state = self.state.write().unwrap();
+            let mut state = self.state.write().await;
             if draw_state.finished {
                 if let Some(ref mut obj) = &mut state.objects[idx] {
                     obj.done = true;
@@ -748,26 +650,32 @@ impl MultiProgress {
             }
 
             let finished = state.is_done();
-            state.draw_target.apply_draw_state(ProgressDrawState {
-                lines,
-                orphan_lines: orphan_lines_count,
-                force_draw: force_draw || orphan_lines_count > 0,
-                move_cursor,
-                finished,
-            })?;
+            state
+                .draw_target
+                .apply_draw_state(ProgressDrawState {
+                    lines,
+                    orphan_lines: orphan_lines_count,
+                    force_draw: force_draw || orphan_lines_count > 0,
+                    move_cursor,
+                    finished,
+                })
+                .await?;
 
             force_draw = false;
         }
 
         if clear {
-            let mut state = self.state.write().unwrap();
-            state.draw_target.apply_draw_state(ProgressDrawState {
-                lines: vec![],
-                orphan_lines: 0,
-                finished: true,
-                force_draw: true,
-                move_cursor,
-            })?;
+            let mut state = self.state.write().await;
+            state
+                .draw_target
+                .apply_draw_state(ProgressDrawState {
+                    lines: vec![],
+                    orphan_lines: 0,
+                    finished: true,
+                    force_draw: true,
+                    move_cursor,
+                })
+                .await?;
         }
 
         self.joining.store(false, Ordering::Release);

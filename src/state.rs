@@ -1,13 +1,14 @@
 use std::borrow::Cow;
 use std::io;
-use std::sync::mpsc::Sender;
-use std::sync::{Arc, Mutex, RwLock};
-use std::thread;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::style::{ProgressFinish, ProgressStyle};
 use crate::utils::{duration_to_secs, secs_to_duration, Estimate};
+use async_channel::Sender;
+use async_lock::{Mutex, RwLock};
 use console::Term;
+use futures_core::future::BoxFuture;
 
 /// The state of a progress bar at a moment in time.
 pub(crate) struct ProgressState {
@@ -24,7 +25,6 @@ pub(crate) struct ProgressState {
     pub(crate) draw_next: u64,
     pub(crate) status: Status,
     pub(crate) est: Estimate,
-    pub(crate) tick_thread: Option<thread::JoinHandle<()>>,
     pub(crate) steady_tick: u64,
 }
 
@@ -80,8 +80,8 @@ impl ProgressState {
     }
 
     /// The entire draw width
-    pub fn width(&self) -> usize {
-        self.draw_target.width()
+    pub async fn width(&self) -> usize {
+        self.draw_target.width().await
     }
 
     /// Return the current average time per step
@@ -119,20 +119,20 @@ impl ProgressState {
 
     /// Call the provided `FnOnce` to update the state. Then redraw the
     /// progress bar if the state has changed.
-    pub fn update_and_draw<F: FnOnce(&mut ProgressState)>(&mut self, f: F) {
+    pub async fn update_and_draw<F: FnOnce(&mut ProgressState)>(&mut self, f: F) {
         if self.update(f) {
-            self.draw().ok();
+            self.draw().await.ok();
         }
     }
 
     /// Call the provided `FnOnce` to update the state. Then unconditionally redraw the
     /// progress bar.
-    pub fn update_and_force_draw<F: FnOnce(&mut ProgressState)>(&mut self, f: F) {
+    pub async fn update_and_force_draw<F: FnOnce(&mut ProgressState)>(&mut self, f: F) {
         self.update(|state| {
             state.draw_next = state.pos;
             f(state);
         });
-        self.draw().ok();
+        self.draw().await.ok();
     }
 
     /// Call the provided `FnOnce` to update the state. If a draw should be run, returns `true`.
@@ -156,76 +156,82 @@ impl ProgressState {
     }
 
     /// Finishes the progress bar and leaves the current message.
-    pub fn finish(&mut self) {
+    pub async fn finish(&mut self) {
         self.update_and_force_draw(|state| {
             state.pos = state.len;
             state.status = Status::DoneVisible;
-        });
+        })
+        .await;
     }
 
     /// Finishes the progress bar at current position and leaves the current message.
-    pub fn finish_at_current_pos(&mut self) {
+    pub async fn finish_at_current_pos(&mut self) {
         self.update_and_force_draw(|state| {
             state.status = Status::DoneVisible;
-        });
+        })
+        .await;
     }
 
     /// Finishes the progress bar and sets a message.
-    pub fn finish_with_message(&mut self, msg: impl Into<Cow<'static, str>>) {
+    pub async fn finish_with_message(&mut self, msg: impl Into<Cow<'static, str>>) {
         let msg = msg.into();
         self.update_and_force_draw(|state| {
             state.message = msg;
             state.pos = state.len;
             state.status = Status::DoneVisible;
-        });
+        })
+        .await;
     }
 
     /// Finishes the progress bar and completely clears it.
-    pub fn finish_and_clear(&mut self) {
+    pub async fn finish_and_clear(&mut self) {
         self.update_and_force_draw(|state| {
             state.pos = state.len;
             state.status = Status::DoneHidden;
-        });
+        })
+        .await;
     }
 
     /// Finishes the progress bar and leaves the current message and progress.
-    pub fn abandon(&mut self) {
+    pub async fn abandon(&mut self) {
         self.update_and_force_draw(|state| {
             state.status = Status::DoneVisible;
-        });
+        })
+        .await;
     }
 
     /// Finishes the progress bar and sets a message, and leaves the current progress.
-    pub fn abandon_with_message(&mut self, msg: impl Into<Cow<'static, str>>) {
+    pub async fn abandon_with_message(&mut self, msg: impl Into<Cow<'static, str>>) {
         let msg = msg.into();
         self.update_and_force_draw(|state| {
             state.message = msg;
             state.status = Status::DoneVisible;
-        });
+        })
+        .await;
     }
 
     /// Finishes the progress bar using the [`ProgressFinish`] behavior stored
     /// in the [`ProgressStyle`].
-    pub fn finish_using_style(&mut self) {
+    pub async fn finish_using_style(&mut self) {
         match self.style.get_on_finish() {
-            ProgressFinish::AndLeave => self.finish(),
-            ProgressFinish::AtCurrentPos => self.finish_at_current_pos(),
+            ProgressFinish::AndLeave => self.finish().await,
+            ProgressFinish::AtCurrentPos => self.finish_at_current_pos().await,
             ProgressFinish::WithMessage(msg) => {
                 // Equivalent to `self.finish_with_message` but avoids borrow checker error
                 self.message.clone_from(msg);
-                self.finish();
+                self.finish().await;
             }
-            ProgressFinish::AndClear => self.finish_and_clear(),
-            ProgressFinish::Abandon => self.abandon(),
+            ProgressFinish::AndClear => self.finish_and_clear().await,
+            ProgressFinish::Abandon => self.abandon().await,
             ProgressFinish::AbandonWithMessage(msg) => {
                 // Equivalent to `self.abandon_with_message` but avoids borrow checker error
                 self.message.clone_from(msg);
-                self.abandon();
+                self.abandon().await;
             }
         }
     }
 
-    pub(crate) fn draw(&mut self) -> io::Result<()> {
+    pub(crate) async fn draw(&mut self) -> io::Result<()> {
         // we can bail early if the draw target is hidden.
         if self.draw_target.is_hidden() {
             return Ok(());
@@ -233,7 +239,7 @@ impl ProgressState {
 
         let draw_state = ProgressDrawState {
             lines: if self.should_render() {
-                self.style.format_state(&*self)
+                self.style.format_state(&*self).await
             } else {
                 vec![]
             },
@@ -242,18 +248,7 @@ impl ProgressState {
             force_draw: false,
             move_cursor: false,
         };
-        self.draw_target.apply_draw_state(draw_state)
-    }
-}
-
-impl Drop for ProgressState {
-    fn drop(&mut self) {
-        // Progress bar is already finished.  Do not need to do anything.
-        if self.is_finished() {
-            return;
-        }
-
-        self.finish_using_style();
+        self.draw_target.apply_draw_state(draw_state).await
     }
 }
 
@@ -271,8 +266,8 @@ pub(crate) struct MultiProgressState {
 }
 
 impl MultiProgressState {
-    fn width(&self) -> usize {
-        self.draw_target.width()
+    fn width(&self) -> BoxFuture<'_, usize> {
+        Box::pin(async move { self.draw_target.width().await })
     }
 
     pub(crate) fn is_done(&self) -> bool {
@@ -449,16 +444,19 @@ impl ProgressDrawTarget {
     }
 
     /// Returns the current width of the draw target.
-    fn width(&self) -> usize {
+    async fn width<'a>(&'a self) -> usize {
         match self.kind {
             ProgressDrawTargetKind::Term { ref term, .. } => term.size().1 as usize,
-            ProgressDrawTargetKind::Remote { ref state, .. } => state.read().unwrap().width(),
+            ProgressDrawTargetKind::Remote { ref state, .. } => state.read().await.width().await,
             ProgressDrawTargetKind::Hidden => 0,
         }
     }
 
     /// Apply the given draw state (draws it).
-    pub(crate) fn apply_draw_state(&mut self, draw_state: ProgressDrawState) -> io::Result<()> {
+    pub(crate) async fn apply_draw_state(
+        &mut self,
+        draw_state: ProgressDrawState,
+    ) -> io::Result<()> {
         let (term, last_line_count, last_draw) = match self.kind {
             ProgressDrawTargetKind::Term {
                 ref term,
@@ -471,8 +469,9 @@ impl ProgressDrawTarget {
             ProgressDrawTargetKind::Remote { idx, ref chan, .. } => {
                 return chan
                     .lock()
-                    .unwrap()
+                    .await
                     .send((idx, draw_state))
+                    .await
                     .map_err(|e| io::Error::new(io::ErrorKind::Other, e));
             }
             // Hidden, finished, or no need to refresh yet
@@ -493,12 +492,12 @@ impl ProgressDrawTarget {
     }
 
     /// Properly disconnects from the draw target
-    pub(crate) fn disconnect(&self) {
+    pub(crate) async fn disconnect(&self) {
         match self.kind {
             ProgressDrawTargetKind::Term { .. } => {}
             ProgressDrawTargetKind::Remote { idx, ref chan, .. } => {
                 chan.lock()
-                    .unwrap()
+                    .await
                     .send((
                         idx,
                         ProgressDrawState {
@@ -509,6 +508,7 @@ impl ProgressDrawTarget {
                             move_cursor: false,
                         },
                     ))
+                    .await
                     .ok();
             }
             ProgressDrawTargetKind::Hidden => {}
